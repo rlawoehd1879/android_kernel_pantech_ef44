@@ -310,6 +310,13 @@ void log_buf_clear(void)
 	logged_chars = 0;
 }
 
+#ifdef CONFIG_PANTECH_ERR_CRASH_LOGGING
+void* get_log_buf_addr(void)
+{
+	return (void*)log_buf;
+}
+#endif
+
 /*
  * Copy a range of characters from the log buffer.
  */
@@ -939,9 +946,6 @@ asmlinkage int vprintk(const char *fmt, va_list args)
 
 
 	p = printk_buf;
-#ifdef CONFIG_LGE_CRASH_HANDLER
-	store_crash_log(p);
-#endif
 
 	/* Read log level and handle special printk prefix */
 	plen = log_prefix(p, &current_log_level, &special);
@@ -1391,8 +1395,10 @@ again:
 	raw_spin_unlock_irqrestore(&logbuf_lock, flags);
 
 	if (retry && console_trylock())
+	{
+		retry = 0; 
 		goto again;
-
+	}
 	if (wake_klogd)
 		wake_up_klogd();
 }

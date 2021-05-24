@@ -1,7 +1,7 @@
 /*
  * TSIF Driver
  *
- * Copyright (c) 2012-2013, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2009-2012, Code Aurora Forum. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -32,8 +32,13 @@
 #include <linux/pm_runtime.h>
 #include <linux/slab.h>          /* kfree, kzalloc */
 #include <linux/gpio.h>
+
 #include <mach/dma.h>
 #include <mach/msm_tsif.h>
+
+#ifdef CONFIG_SKY_DMB_TSIF_IF
+#include <linux/ratelimit.h>
+#endif
 
 /*
  * TSIF register offsets
@@ -140,10 +145,6 @@ struct msm_tsif_device {
 	unsigned int irq;
 	int mode;
 	u32 time_limit;
-	int clock_inverse;
-	int data_inverse;
-	int sync_inverse;
-	int enable_inverse;
 	enum tsif_state state;
 	struct wake_lock wake_lock;
 	/* clocks */
@@ -172,7 +173,6 @@ struct msm_tsif_device {
 	dma_addr_t dmov_cmd_dma[2];
 	struct tsif_xfer xfer[2];
 	struct tasklet_struct dma_refill;
-	struct tasklet_struct clocks_off;
 	/* statistics */
 	u32 stat_rx;
 	u32 stat_overflow;
@@ -186,6 +186,34 @@ struct msm_tsif_device {
 	void *client_data;
 	void (*client_notify)(void *client_data);
 };
+
+
+#ifdef CONFIG_SKY_DMB_TSIF_IF
+#ifdef CONFIG_SKY_TDMB
+extern irqreturn_t tdmb_interrupt(int irq, void *dev_id);
+#elif defined(CONFIG_SKY_ISDBT)
+extern irqreturn_t isdbt_interrupt(int irq, void *dev_id);
+#else
+## error
+#endif
+//#define FEATURE_TSIF_DEBUG_MSG
+//#define FEATURE_TSIF_CHECK_ON_BOOT
+
+#ifdef FEATURE_TSIF_CHECK_ON_BOOT
+unsigned char tsif_buf[TSIF_PKT_SIZE*TSIF_PKTS_IN_CHUNK_DEFAULT];
+static void tsif_data_check_on_boot(void * data_buffer, int size)
+{
+	int i;
+	memset((void*)&tsif_buf, 0xff, sizeof(tsif_buf));
+	for(i=0; i < (size/TSIF_PKT_SIZE); i++)
+	{
+		memcpy((void*)&tsif_buf[i*188], (data_buffer+i*TSIF_PKT_SIZE), 188);
+		pr_info("TSIF data check [%x] [%x] [%x] [%x]",tsif_buf[i*188],tsif_buf[i*188+1],tsif_buf[i*188+2],tsif_buf[i*188+3]);
+	}
+}
+#endif
+
+#endif /* CONFIG_SKY_DMB_TSIF_IF */
 
 /* ===clocks begin=== */
 
@@ -253,6 +281,11 @@ ret:
 
 static void tsif_clock(struct msm_tsif_device *tsif_device, int on)
 {
+
+#ifdef FEATURE_TSIF_DEBUG_MSG
+	pr_info("[%s] on_off[%d]\n", __func__, on);
+#endif
+
 	if (on) {
 		if (tsif_device->tsif_clk)
 			clk_prepare_enable(tsif_device->tsif_clk);
@@ -267,14 +300,38 @@ static void tsif_clock(struct msm_tsif_device *tsif_device, int on)
 		clk_disable_unprepare(tsif_device->tsif_ref_clk);
 	}
 }
-
-static void tsif_clocks_off(unsigned long data)
-{
-	struct msm_tsif_device *tsif_device = (struct msm_tsif_device *) data;
-	tsif_clock(tsif_device, 0);
-}
 /* ===clocks end=== */
 /* ===gpio begin=== */
+
+static void tsif_gpios_free(const struct msm_gpio *table, int size)
+{
+	int i;
+	const struct msm_gpio *g;
+	for (i = size-1; i >= 0; i--) {
+		g = table + i;
+		gpio_free(GPIO_PIN(g->gpio_cfg));
+	}
+}
+
+static int tsif_gpios_request(const struct msm_gpio *table, int size)
+{
+	int rc;
+	int i;
+	const struct msm_gpio *g;
+	for (i = 0; i < size; i++) {
+		g = table + i;
+		rc = gpio_request(GPIO_PIN(g->gpio_cfg), g->label);
+		if (rc) {
+			pr_err("gpio_request(%d) <%s> failed: %d\n",
+			       GPIO_PIN(g->gpio_cfg), g->label ?: "?", rc);
+			goto err;
+		}
+	}
+	return 0;
+err:
+	tsif_gpios_free(table, i);
+	return rc;
+}
 
 static int tsif_gpios_disable(const struct msm_gpio *table, int size)
 {
@@ -330,14 +387,19 @@ err:
 
 static int tsif_gpios_request_enable(const struct msm_gpio *table, int size)
 {
-	int rc;
+	int rc = tsif_gpios_request(table, size);
+	if (rc)
+		return rc;
 	rc = tsif_gpios_enable(table, size);
+	if (rc)
+		tsif_gpios_free(table, size);
 	return rc;
 }
 
 static void tsif_gpios_disable_free(const struct msm_gpio *table, int size)
 {
 	tsif_gpios_disable(table, size);
+	tsif_gpios_free(table, size);
 }
 
 static int tsif_start_gpios(struct msm_tsif_device *tsif_device)
@@ -361,21 +423,17 @@ static int tsif_start_hw(struct msm_tsif_device *tsif_device)
 	u32 ctl = TSIF_STS_CTL_EN_IRQ |
 		  TSIF_STS_CTL_EN_TIME_LIM |
 		  TSIF_STS_CTL_EN_TCR |
-		  TSIF_STS_CTL_EN_DM;
-
-	if (tsif_device->clock_inverse)
-		ctl |= TSIF_STS_CTL_INV_CLOCK;
-
-	if (tsif_device->data_inverse)
-		ctl |= TSIF_STS_CTL_INV_DATA;
-
-	if (tsif_device->sync_inverse)
-		ctl |= TSIF_STS_CTL_INV_SYNC;
-
-	if (tsif_device->enable_inverse)
-		ctl |= TSIF_STS_CTL_INV_ENABLE;
-
+		  TSIF_STS_CTL_EN_DM
+#if defined(CONFIG_SKY_TDMB_RTV_BB) && defined(CONFIG_MACH_MSM8960_EF46L) //EF46L_PT only RaonTech
+		  | TSIF_STS_CTL_INV_CLOCK
+#endif
+		  ;
 	dev_info(&tsif_device->pdev->dev, "%s\n", __func__);
+
+#ifdef FEATURE_TSIF_DEBUG_MSG
+	pr_info("[%s] mode[%d]\n", __func__, tsif_device->mode);
+#endif
+
 	switch (tsif_device->mode) {
 	case 1: /* mode 1 */
 		ctl |= (0 << 5);
@@ -520,6 +578,11 @@ static void tsif_dmov_complete_func(struct msm_dmov_cmd *cmd,
 	struct tsif_xfer *xfer;
 	struct msm_tsif_device *tsif_device;
 	int reschedule = 0;
+
+#ifdef FEATURE_TSIF_DEBUG_MSG
+	pr_info("[%s], result[0x%08x]\n", __func__, result);
+#endif
+
 	if (!(result & DMOV_RSLT_VALID)) { /* can I trust to @cmd? */
 		pr_err("Invalid DMOV result: rc=0x%08x, cmd = %p", result, cmd);
 		return;
@@ -548,6 +611,23 @@ static void tsif_dmov_complete_func(struct msm_dmov_cmd *cmd,
 		if (w == xfer->wi)
 			tsif_device->stat_soft_drop++;
 		reschedule = (tsif_device->state == tsif_state_running);
+
+#ifdef CONFIG_SKY_DMB_TSIF_IF
+#ifdef CONFIG_SKY_TDMB
+		tdmb_interrupt((int)tsif_device->irq, (void*)tsif_device->pdev->id);
+#elif defined(CONFIG_SKY_ISDBT)
+		isdbt_interrupt((int)tsif_device->irq, (void*)tsif_device->pdev->id);
+#endif
+#endif
+
+#ifdef FEATURE_TSIF_CHECK_ON_BOOT
+{
+    void *data_addr;
+    data_addr= tsif_device->data_buffer + data_offset;
+    tsif_data_check_on_boot(data_addr, TSIF_PKT_SIZE*TSIF_PKTS_IN_CHUNK);
+}
+#endif
+
 #ifdef CONFIG_TSIF_DEBUG
 		/* IFI calculation */
 		/*
@@ -593,15 +673,17 @@ static void tsif_dmov_complete_func(struct msm_dmov_cmd *cmd,
 			if (tsif_device->state == tsif_state_running) {
 				tsif_stop_hw(tsif_device);
 				/*
-				 * This branch is taken only in case of
+				 * Clocks _may_ be stopped right from IRQ
+				 * context. This is far from optimal w.r.t
+				 * latency.
+				 *
+				 * But, this branch taken only in case of
 				 * severe hardware problem (I don't even know
-				 * what should happen for DMOV_RSLT_ERROR);
+				 * what should happens for DMOV_RSLT_ERROR);
 				 * thus I prefer code simplicity over
 				 * performance.
-				 * Clocks are turned off from outside the
-				 * interrupt context.
 				 */
-				tasklet_schedule(&tsif_device->clocks_off);
+				tsif_clock(tsif_device, 0);
 				tsif_device->state = tsif_state_flushing;
 			}
 		}
@@ -776,7 +858,11 @@ static irqreturn_t tsif_irq(int irq, void *dev_id)
 		tsif_device->stat_rx++;
 	}
 	if (sts_ctl & TSIF_STS_CTL_OVERFLOW) {
+#ifdef CONFIG_SKY_DMB_TSIF_IF
+		printk_ratelimited("TSIF IRQ: OVERFLOW\n");
+#else
 		dev_info(&tsif_device->pdev->dev, "TSIF IRQ: OVERFLOW\n");
+#endif
 		tsif_device->stat_overflow++;
 	}
 	if (sts_ctl & TSIF_STS_CTL_LOST_SYNC) {
@@ -822,10 +908,6 @@ static ssize_t show_stats(struct device *dev, struct device_attribute *attr,
 			"Client     = %p\n"
 			"Pkt/Buf    = %d\n"
 			"Pkt/chunk  = %d\n"
-			"Clock inv  = %d\n"
-			"Data inv   = %d\n"
-			"Sync inv   = %d\n"
-			"Enable inv = %d\n"
 			"--statistics--\n"
 			"Rx chunks  = %d\n"
 			"Overflow   = %d\n"
@@ -848,10 +930,6 @@ static ssize_t show_stats(struct device *dev, struct device_attribute *attr,
 			tsif_device->client_data,
 			TSIF_PKTS_IN_BUF,
 			TSIF_PKTS_IN_CHUNK,
-			tsif_device->clock_inverse,
-			tsif_device->data_inverse,
-			tsif_device->sync_inverse,
-			tsif_device->enable_inverse,
 			tsif_device->stat_rx,
 			tsif_device->stat_overflow,
 			tsif_device->stat_lost_sync,
@@ -975,120 +1053,11 @@ static ssize_t set_buf_config(struct device *dev,
 static DEVICE_ATTR(buf_config, S_IRUGO | S_IWUSR,
 		   show_buf_config, set_buf_config);
 
-static ssize_t show_clk_inverse(struct device *dev,
-				struct device_attribute *attr, char *buf)
-{
-	struct msm_tsif_device *tsif_device = dev_get_drvdata(dev);
-	return snprintf(buf, PAGE_SIZE, "%d\n", tsif_device->clock_inverse);
-}
-
-static ssize_t set_clk_inverse(struct device *dev,
-		struct device_attribute *attr, const char *buf, size_t count)
-{
-	struct msm_tsif_device *tsif_device = dev_get_drvdata(dev);
-	int value;
-	int rc;
-	if (1 != sscanf(buf, "%d", &value)) {
-		dev_err(&tsif_device->pdev->dev,
-			"Failed to parse integer: <%s>\n", buf);
-		return -EINVAL;
-	}
-	rc = tsif_set_clk_inverse(tsif_device, value);
-	if (!rc)
-		rc = count;
-	return rc;
-}
-static DEVICE_ATTR(clk_inverse, S_IRUGO | S_IWUSR,
-	show_clk_inverse, set_clk_inverse);
-
-static ssize_t show_data_inverse(struct device *dev,
-				struct device_attribute *attr, char *buf)
-{
-	struct msm_tsif_device *tsif_device = dev_get_drvdata(dev);
-	return snprintf(buf, PAGE_SIZE, "%d\n", tsif_device->data_inverse);
-}
-
-static ssize_t set_data_inverse(struct device *dev,
-		struct device_attribute *attr, const char *buf, size_t count)
-{
-	struct msm_tsif_device *tsif_device = dev_get_drvdata(dev);
-	int value;
-	int rc;
-	if (1 != sscanf(buf, "%d", &value)) {
-		dev_err(&tsif_device->pdev->dev,
-			"Failed to parse integer: <%s>\n", buf);
-		return -EINVAL;
-	}
-	rc = tsif_set_data_inverse(tsif_device, value);
-	if (!rc)
-		rc = count;
-	return rc;
-}
-static DEVICE_ATTR(data_inverse, S_IRUGO | S_IWUSR,
-	show_data_inverse, set_data_inverse);
-
-static ssize_t show_sync_inverse(struct device *dev,
-				struct device_attribute *attr, char *buf)
-{
-	struct msm_tsif_device *tsif_device = dev_get_drvdata(dev);
-	return snprintf(buf, PAGE_SIZE, "%d\n", tsif_device->sync_inverse);
-}
-
-static ssize_t set_sync_inverse(struct device *dev,
-		struct device_attribute *attr, const char *buf, size_t count)
-{
-	struct msm_tsif_device *tsif_device = dev_get_drvdata(dev);
-	int value;
-	int rc;
-	if (1 != sscanf(buf, "%d", &value)) {
-		dev_err(&tsif_device->pdev->dev,
-			"Failed to parse integer: <%s>\n", buf);
-		return -EINVAL;
-	}
-	rc = tsif_set_sync_inverse(tsif_device, value);
-	if (!rc)
-		rc = count;
-	return rc;
-}
-static DEVICE_ATTR(sync_inverse, S_IRUGO | S_IWUSR,
-	show_sync_inverse, set_sync_inverse);
-
-static ssize_t show_enable_inverse(struct device *dev,
-				struct device_attribute *attr, char *buf)
-{
-	struct msm_tsif_device *tsif_device = dev_get_drvdata(dev);
-	return snprintf(buf, PAGE_SIZE, "%d\n", tsif_device->enable_inverse);
-}
-
-static ssize_t set_enable_inverse(struct device *dev,
-		struct device_attribute *attr, const char *buf, size_t count)
-{
-	struct msm_tsif_device *tsif_device = dev_get_drvdata(dev);
-	int value;
-	int rc;
-	if (1 != sscanf(buf, "%d", &value)) {
-		dev_err(&tsif_device->pdev->dev,
-			"Failed to parse integer: <%s>\n", buf);
-		return -EINVAL;
-	}
-	rc = tsif_set_enable_inverse(tsif_device, value);
-	if (!rc)
-		rc = count;
-	return rc;
-}
-static DEVICE_ATTR(enable_inverse, S_IRUGO | S_IWUSR,
-	show_enable_inverse, set_enable_inverse);
-
-
 static struct attribute *dev_attrs[] = {
 	&dev_attr_stats.attr,
 	&dev_attr_mode.attr,
 	&dev_attr_time_limit.attr,
 	&dev_attr_buf_config.attr,
-	&dev_attr_clk_inverse.attr,
-	&dev_attr_data_inverse.attr,
-	&dev_attr_sync_inverse.attr,
-	&dev_attr_enable_inverse.attr,
 	NULL,
 };
 static struct attribute_group dev_attr_grp = {
@@ -1127,7 +1096,6 @@ static int action_open(struct msm_tsif_device *tsif_device)
 
 	struct msm_tsif_platform_data *pdata =
 		tsif_device->pdev->dev.platform_data;
-
 	dev_info(&tsif_device->pdev->dev, "%s\n", __func__);
 	if (tsif_device->state != tsif_state_stopped)
 		return -EAGAIN;
@@ -1137,6 +1105,14 @@ static int action_open(struct msm_tsif_device *tsif_device)
 		return rc;
 	}
 	tsif_device->state = tsif_state_running;
+
+	/* make sure the GPIO's are set up */
+	rc = tsif_start_gpios(tsif_device);
+	if (rc) {
+		dev_err(&tsif_device->pdev->dev, "failed to start GPIOs\n");
+		tsif_dma_exit(tsif_device);
+		return rc;
+	}
 
 	/*
 	 * DMA should be scheduled prior to TSIF hardware initialization,
@@ -1153,20 +1129,9 @@ static int action_open(struct msm_tsif_device *tsif_device)
 	rc = tsif_start_hw(tsif_device);
 	if (rc) {
 		dev_err(&tsif_device->pdev->dev, "Unable to start HW\n");
+		tsif_stop_gpios(tsif_device);
 		tsif_dma_exit(tsif_device);
 		tsif_clock(tsif_device, 0);
-		disable_irq(tsif_device->irq);
-		return rc;
-	}
-
-	/* make sure the GPIO's are set up */
-	rc = tsif_start_gpios(tsif_device);
-	if (rc) {
-		dev_err(&tsif_device->pdev->dev, "failed to start GPIOs\n");
-		tsif_stop_hw(tsif_device);
-		tsif_dma_exit(tsif_device);
-		tsif_clock(tsif_device, 0);
-		disable_irq(tsif_device->irq);
 		return rc;
 	}
 
@@ -1175,16 +1140,16 @@ static int action_open(struct msm_tsif_device *tsif_device)
 		dev_err(&tsif_device->pdev->dev,
 			"Runtime PM: Unable to wake up the device, rc = %d\n",
 			result);
-		tsif_stop_gpios(tsif_device);
-		tsif_stop_hw(tsif_device);
-		tsif_dma_exit(tsif_device);
-		tsif_clock(tsif_device, 0);
-		disable_irq(tsif_device->irq);
 		return result;
 	}
 
 	wake_lock(&tsif_device->wake_lock);
-	return 0;
+
+#ifdef FEATURE_TSIF_DEBUG_MSG
+	pr_info("[%s] end\n", __func__);
+#endif
+  
+	return rc;
 }
 
 static int action_close(struct msm_tsif_device *tsif_device)
@@ -1201,7 +1166,7 @@ static int action_close(struct msm_tsif_device *tsif_device)
 	 * there are any outstanding reads on the bus, and if we
 	 * stop the TSIF too quickly, it can cause a bus error.
 	 */
-	msleep(250);
+	msleep(100);
 
 	/* now we can stop the core */
 	tsif_stop_hw(tsif_device);
@@ -1421,15 +1386,9 @@ static int __devinit msm_tsif_probe(struct platform_device *pdev)
 	tsif_device->pdev = pdev;
 	platform_set_drvdata(pdev, tsif_device);
 	tsif_device->mode = 1;
-	tsif_device->clock_inverse = 0;
-	tsif_device->data_inverse = 0;
-	tsif_device->sync_inverse = 0;
-	tsif_device->enable_inverse = 0;
 	tsif_device->pkts_per_chunk = TSIF_PKTS_IN_CHUNK_DEFAULT;
 	tsif_device->chunks_per_buf = TSIF_CHUNKS_IN_BUF_DEFAULT;
 	tasklet_init(&tsif_device->dma_refill, tsif_dma_refill,
-		     (unsigned long)tsif_device);
-	tasklet_init(&tsif_device->clocks_off, tsif_clocks_off,
 		     (unsigned long)tsif_device);
 	if (tsif_get_clocks(tsif_device))
 		goto err_clocks;
@@ -1672,78 +1631,6 @@ int tsif_set_buf_config(void *cookie, u32 pkts_in_chunk, u32 chunks_in_buf)
 }
 EXPORT_SYMBOL(tsif_set_buf_config);
 
-int tsif_set_clk_inverse(void *cookie, int value)
-{
-	struct msm_tsif_device *tsif_device = cookie;
-	if (tsif_device->state != tsif_state_stopped) {
-		dev_err(&tsif_device->pdev->dev,
-			"Can't change clock inverse while device is active\n");
-		return -EBUSY;
-	}
-	if ((value != 0) && (value != 1)) {
-		dev_err(&tsif_device->pdev->dev,
-			"Invalid parameter, either 0 or 1: %#x\n", value);
-		return -EINVAL;
-	}
-	tsif_device->clock_inverse = value;
-	return 0;
-}
-EXPORT_SYMBOL(tsif_set_clk_inverse);
-
-int tsif_set_data_inverse(void *cookie, int value)
-{
-	struct msm_tsif_device *tsif_device = cookie;
-	if (tsif_device->state != tsif_state_stopped) {
-		dev_err(&tsif_device->pdev->dev,
-			"Can't change data inverse while device is active\n");
-		return -EBUSY;
-	}
-	if ((value != 0) && (value != 1)) {
-		dev_err(&tsif_device->pdev->dev,
-			"Invalid parameter, either 0 or 1: %#x\n", value);
-		return -EINVAL;
-	}
-	tsif_device->data_inverse = value;
-	return 0;
-}
-EXPORT_SYMBOL(tsif_set_data_inverse);
-
-int tsif_set_sync_inverse(void *cookie, int value)
-{
-	struct msm_tsif_device *tsif_device = cookie;
-	if (tsif_device->state != tsif_state_stopped) {
-		dev_err(&tsif_device->pdev->dev,
-			"Can't change sync inverse while device is active\n");
-		return -EBUSY;
-	}
-	if ((value != 0) && (value != 1)) {
-		dev_err(&tsif_device->pdev->dev,
-			"Invalid parameter, either 0 or 1: %#x\n", value);
-		return -EINVAL;
-	}
-	tsif_device->sync_inverse = value;
-	return 0;
-}
-EXPORT_SYMBOL(tsif_set_sync_inverse);
-
-int tsif_set_enable_inverse(void *cookie, int value)
-{
-	struct msm_tsif_device *tsif_device = cookie;
-	if (tsif_device->state != tsif_state_stopped) {
-		dev_err(&tsif_device->pdev->dev,
-			"Can't change enable inverse while device is active\n");
-		return -EBUSY;
-	}
-	if ((value != 0) && (value != 1)) {
-		dev_err(&tsif_device->pdev->dev,
-			"Invalid parameter, either 0 or 1: %#x\n", value);
-		return -EINVAL;
-	}
-	tsif_device->enable_inverse = value;
-	return 0;
-}
-EXPORT_SYMBOL(tsif_set_enable_inverse);
-
 void tsif_get_state(void *cookie, int *ri, int *wi, enum tsif_state *state)
 {
 	struct msm_tsif_device *tsif_device = cookie;
@@ -1769,22 +1656,6 @@ void tsif_stop(void *cookie)
 	action_close(tsif_device);
 }
 EXPORT_SYMBOL(tsif_stop);
-
-int tsif_get_ref_clk_counter(void *cookie, u32 *tcr_counter)
-{
-	struct msm_tsif_device *tsif_device = cookie;
-
-	if (!tsif_device || !tcr_counter)
-		return -EINVAL;
-
-	if (tsif_device->state == tsif_state_running)
-		*tcr_counter = ioread32(tsif_device->base + TSIF_CLK_REF_OFF);
-	else
-		*tcr_counter = 0;
-
-	return 0;
-}
-EXPORT_SYMBOL(tsif_get_ref_clk_counter);
 
 void tsif_reclaim_packets(void *cookie, int read_index)
 {

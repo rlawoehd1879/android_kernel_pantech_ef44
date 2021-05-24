@@ -25,3 +25,4 @@ make savedefconfig ARCH=arm
 mv defconfig arch/arm/configs/${DEFCONFIG_FILE}
 # clean kernel object
 make mrproper
+

@@ -23,7 +23,6 @@
 #include <linux/init.h>
 #include <linux/nmi.h>
 #include <linux/dmi.h>
-#include <linux/coresight.h>
 
 #define PANIC_TIMER_STEP 100
 #define PANIC_BLINK_SPD 18
@@ -37,6 +36,9 @@ static int pause_on_oops;
 static int pause_on_oops_flag;
 static DEFINE_SPINLOCK(pause_on_oops_lock);
 
+#ifdef CONFIG_PANTECH_ERR_CRASH_LOGGING
+extern void pantech_machine_crash_shutdown(struct pt_regs *regs);
+#endif
 #ifndef CONFIG_PANIC_TIMEOUT
 #define CONFIG_PANIC_TIMEOUT 0
 #endif
@@ -81,7 +83,6 @@ void panic(const char *fmt, ...)
 	long i, i_next = 0;
 	int state = 0;
 
-	coresight_abort();
 	/*
 	 * Disable local interrupts. This will prevent panic_smp_self_stop
 	 * from deadlocking the first cpu that invokes the panic, since
@@ -108,14 +109,7 @@ void panic(const char *fmt, ...)
 	va_start(args, fmt);
 	vsnprintf(buf, sizeof(buf), fmt, args);
 	va_end(args);
-#ifdef CONFIG_LGE_CRASH_HANDLER
-	set_kernel_crash_magic_number();
-	set_crash_store_enable();
-#endif
 	printk(KERN_EMERG "Kernel panic - not syncing: %s\n",buf);
-#ifdef CONFIG_LGE_CRASH_HANDLER
-	set_crash_store_disable();
-#endif
 #ifdef CONFIG_DEBUG_BUGVERBOSE
 	/*
 	 * Avoid nested stack-dumping if a panic occurs during oops processing
@@ -124,6 +118,10 @@ void panic(const char *fmt, ...)
 		dump_stack();
 #endif
 
+#ifdef CONFIG_PANTECH_ERR_CRASH_LOGGING
+	printk(KERN_DEBUG "CPU %u has crashed in panic\n", smp_processor_id());
+	pantech_machine_crash_shutdown(NULL);		
+#endif
 	/*
 	 * If we have crashed and we have a crash kernel loaded let it handle
 	 * everything else.
@@ -138,7 +136,9 @@ void panic(const char *fmt, ...)
 	 * unfortunately means it may not be hardened to work in a panic
 	 * situation.
 	 */
+#ifndef CONFIG_PANTECH_ERR_CRASH_LOGGING
 	smp_send_stop();
+#endif
 
 	atomic_notifier_call_chain(&panic_notifier_list, 0, buf);
 

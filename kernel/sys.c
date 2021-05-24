@@ -415,7 +415,9 @@ void kernel_power_off(void)
 	machine_power_off();
 }
 EXPORT_SYMBOL_GPL(kernel_power_off);
-
+#if defined(CONFIG_PANTECH_LCD_POWEROFFSEQ_ON_PHONEOFF) 
+extern void msm_fb_panel_power_off(void);
+#endif
 static DEFINE_MUTEX(reboot_mutex);
 
 /*
@@ -452,7 +454,9 @@ SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,
 	ret = reboot_pid_ns(task_active_pid_ns(current), cmd);
 	if (ret)
 		return ret;
-
+#if defined(CONFIG_PANTECH_LCD_POWEROFFSEQ_ON_PHONEOFF) 
+	msm_fb_panel_power_off();
+#endif
 	/* Instead of trying to make the power_off code look like
 	 * halt when pm_power_off is not set do it the easy way.
 	 */

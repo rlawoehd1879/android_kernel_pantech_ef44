@@ -301,15 +301,6 @@ void machine_shutdown(void)
 {
 	preempt_disable();
 #ifdef CONFIG_SMP
-	/*
-	 * Disable preemption so we're guaranteed to
-	 * run to power off or reboot and prevent
-	 * the possibility of switching to another
-	 * thread that might wind up blocking on
-	 * one of the stopped CPUs.
-	 */
-	preempt_disable();
-
 	smp_send_stop();
 #endif
 }
@@ -331,6 +322,9 @@ void machine_restart(char *cmd)
 {
 	machine_shutdown();
 
+#ifdef CONFIG_PANTECH_ERR_CRASH_LOGGING 
+	pantech_set_restart_reason();
+#endif
 	/* Flush the console to make sure all the relevant messages make it
 	 * out to the console drivers */
 	arm_machine_flush_console();
@@ -416,16 +410,65 @@ static void show_extra_register_data(struct pt_regs *regs, int nbytes)
 	set_fs(fs);
 }
 
+#ifdef CONFIG_PANTECH_ERR_CRASH_LOGGING
+
+#define LINUX_SAVE_INFO_MAGIC 0xBADC0257
+
+struct mmu_type {
+	unsigned int transbase;
+	unsigned int dac;
+	unsigned int control;
+};
+
+struct save_info_type {
+	unsigned int magic_num;
+	struct pt_regs regs;
+#ifdef CONFIG_CPU_CP15_MMU
+	struct mmu_type mmu;
+#endif
+};
+
+static struct save_info_type save_info;
+
+struct pt_regs *__get_regs_crashed(void)
+{
+	return (struct pt_regs *)&save_info.regs;
+}
+
+void __save_regs_and_mmu(struct pt_regs *regs)
+{
+	memset((unsigned char *)&save_info,0,sizeof(struct save_info_type));
+
+	memcpy((unsigned char *)&save_info.regs,(unsigned char *)regs,sizeof(struct pt_regs));
+
+#ifdef CONFIG_CPU_CP15
+	{
+		unsigned int ctrl;
+#ifdef CONFIG_CPU_CP15_MMU
+		{
+			unsigned int transbase, dac;
+			asm("mrc p15, 0, %0, c2, c0\n\t"
+                        "mrc p15, 0, %1, c3, c0\n"
+                        : "=r" (transbase), "=r" (dac));
+
+			save_info.mmu.transbase = transbase; 
+			save_info.mmu.dac             = dac;
+		}
+#endif
+		asm("mrc p15, 0, %0, c1, c0\n" : "=r" (ctrl));
+		save_info.mmu.control      = ctrl;
+	}
+#endif
+      save_info.magic_num = LINUX_SAVE_INFO_MAGIC;
+}
+#endif
+
 void __show_regs(struct pt_regs *regs)
 {
 	unsigned long flags;
 	char buf[64];
-
-#ifdef CONFIG_LGE_CRASH_HANDLER
-#ifdef CONFIG_CPU_CP15_MMU
-	unsigned int c1, c2;
-#endif
-	set_crash_store_enable();
+#ifdef CONFIG_PANTECH_ERR_CRASH_LOGGING
+	char symbuf[64];
 #endif
 	printk("CPU: %d    %s  (%s %.*s)\n",
 		raw_smp_processor_id(), print_tainted(),
@@ -433,12 +476,12 @@ void __show_regs(struct pt_regs *regs)
 		(int)strcspn(init_utsname()->version, " "),
 		init_utsname()->version);
 	print_symbol("PC is at %s\n", instruction_pointer(regs));
-	print_symbol("LR is at %s\n", regs->ARM_lr);
-#ifdef CONFIG_LGE_CRASH_HANDLER
-	printk("pc : <%08lx>    lr : <%08lx>    psr: %08lx\n"
-#else
-	printk("pc : [<%08lx>]    lr : [<%08lx>]    psr: %08lx\n"
+#ifdef CONFIG_PANTECH_ERR_CRASH_LOGGING
+	sprint_symbol(symbuf,instruction_pointer(regs));
+	printcrash("%s\n",symbuf);
 #endif
+	print_symbol("LR is at %s\n", regs->ARM_lr);
+	printk("pc : [<%08lx>]    lr : [<%08lx>]    psr: %08lx\n"
 	       "sp : %08lx  ip : %08lx  fp : %08lx\n",
 		regs->ARM_pc, regs->ARM_lr, regs->ARM_cpsr,
 		regs->ARM_sp, regs->ARM_ip, regs->ARM_fp);
@@ -451,9 +494,6 @@ void __show_regs(struct pt_regs *regs)
 	printk("r3 : %08lx  r2 : %08lx  r1 : %08lx  r0 : %08lx\n",
 		regs->ARM_r3, regs->ARM_r2,
 		regs->ARM_r1, regs->ARM_r0);
-#ifdef CONFIG_LGE_CRASH_HANDLER
-	set_crash_store_disable();
-#endif
 
 	flags = regs->ARM_cpsr;
 	buf[0] = flags & PSR_N_BIT ? 'N' : 'n';
@@ -481,18 +521,11 @@ void __show_regs(struct pt_regs *regs)
 			    : "=r" (transbase), "=r" (dac));
 			snprintf(buf, sizeof(buf), "  Table: %08x  DAC: %08x",
 			  	transbase, dac);
-#if defined(CONFIG_CPU_CP15_MMU) && defined(CONFIG_LGE_CRASH_HANDLER)
-			c1 = transbase;
-			c2 = dac;
-#endif
 		}
 #endif
 		asm("mrc p15, 0, %0, c1, c0\n" : "=r" (ctrl));
 
 		printk("Control: %08x%s\n", ctrl, buf);
-#if defined(CONFIG_CPU_CP15_MMU) && defined(CONFIG_LGE_CRASH_HANDLER)
-		lge_save_ctx(regs, ctrl, c1, c2);
-#endif
 	}
 #endif
 
@@ -673,11 +706,10 @@ unsigned long arch_randomize_brk(struct mm_struct *mm)
 }
 
 #ifdef CONFIG_MMU
-#ifdef CONFIG_KUSER_HELPERS
 /*
  * The vectors page is always readable from user space for the
- * atomic helpers. Insert it into the gate_vma so that it is visible
- * through ptrace and /proc/<pid>/mem.
+ * atomic helpers and the signal restart code. Insert it into the
+ * gate_vma so that it is visible through ptrace and /proc/<pid>/mem.
  */
 static struct vm_area_struct gate_vma;
 
@@ -706,53 +738,9 @@ int in_gate_area_no_mm(unsigned long addr)
 {
 	return in_gate_area(NULL, addr);
 }
-#define is_gate_vma(vma)	((vma) == &gate_vma)
-#else
-#define is_gate_vma(vma)	0
-#endif
 
 const char *arch_vma_name(struct vm_area_struct *vma)
 {
-	if (is_gate_vma(vma))
-		return "[vectors]";
-	else if (vma->vm_mm && vma->vm_start == vma->vm_mm->context.sigpage)
-		return "[sigpage]";
-	else if (vma == get_user_timers_vma(NULL))
-		return "[timers]";
-	else
-		return NULL;
-}
-
-static struct page *signal_page;
-extern struct page *get_signal_page(void);
-
-int arch_setup_additional_pages(struct linux_binprm *bprm, int uses_interp)
-{
-	struct mm_struct *mm = current->mm;
-	unsigned long addr;
-	int ret;
-
-	if (!signal_page)
-		signal_page = get_signal_page();
-	if (!signal_page)
-		return -ENOMEM;
-
-	down_write(&mm->mmap_sem);
-	addr = get_unmapped_area(NULL, 0, PAGE_SIZE, 0, 0);
-	if (IS_ERR_VALUE(addr)) {
-		ret = addr;
-		goto up_fail;
-	}
-
-	ret = install_special_mapping(mm, addr, PAGE_SIZE,
-		VM_READ | VM_EXEC | VM_MAYREAD | VM_MAYWRITE | VM_MAYEXEC,
-		&signal_page);
-
-	if (ret == 0)
-		mm->context.sigpage = addr;
-
- up_fail:
-	up_write(&mm->mmap_sem);
-	return ret;
+	return (vma == &gate_vma) ? "[vectors]" : NULL;
 }
 #endif

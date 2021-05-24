@@ -1,4 +1,4 @@
-/* Copyright (c) 2011, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2011, Code Aurora Forum. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -794,8 +794,7 @@ u32 send_voice_apr(u32 mode, void *buf, u32 opcode)
 		goto done;
 	}
 
-	if (copy_from_user(&payload_size, buf + sizeof(payload_size),
-						sizeof(payload_size))) {
+	if (copy_from_user(&payload_size, buf + sizeof(u32), sizeof(u32))) {
 		pr_err("%s: Could not copy payload size from user buffer\n",
 			__func__);
 		goto done;
@@ -807,8 +806,7 @@ u32 send_voice_apr(u32 mode, void *buf, u32 opcode)
 		goto done;
 	}
 
-	if (copy_from_user(&dest_port, buf + 2 * sizeof(dest_port),
-						sizeof(dest_port))) {
+	if (copy_from_user(&dest_port, buf + 2 * sizeof(u32), sizeof(u32))) {
 		pr_err("%s: Could not copy port id from user buffer\n",
 			__func__);
 		goto done;

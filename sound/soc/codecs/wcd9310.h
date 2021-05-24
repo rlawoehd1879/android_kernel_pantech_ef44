@@ -1,4 +1,4 @@
-/* Copyright (c) 2011-2012, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2011-2012, Code Aurora Forum. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -176,7 +176,6 @@ struct tabla_mbhc_config {
 	unsigned int gpio;
 	unsigned int gpio_irq;
 	int gpio_level_insert;
-	bool detect_extn_cable;
 	/* swap_gnd_mic returns true if extern GND/MIC swap switch toggled */
 	bool (*swap_gnd_mic) (struct snd_soc_codec *);
 };
@@ -191,6 +190,10 @@ struct anc_header {
 
 extern int tabla_mclk_enable(struct snd_soc_codec *codec, int mclk_enable,
 			     bool dapm);
+
+#ifdef CONFIG_PANTECH_SND // [CHD] for bootsound headset path info
+int wcd9310_headsetJackStatusGet(void);
+#endif
 
 extern void *tabla_mbhc_cal_btn_det_mp(const struct tabla_mbhc_btn_detect_cfg
 				       *btn_det,

@@ -2,7 +2,7 @@
  * drivers/serial/msm_serial.c - driver for msm7k serial device and console
  *
  * Copyright (C) 2007 Google, Inc.
- * Copyright (c) 2010-2013, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2010-2012, Code Aurora Forum. All rights reserved.
  *
  * This software is licensed under the terms of the GNU General Public
  * License version 2, as published by the Free Software Foundation, and
@@ -48,13 +48,6 @@
 #include <asm/mach-types.h>
 #include "msm_serial_hs_hwreg.h"
 
-#ifdef CONFIG_MACH_APQ8064_MAKO
-/* HACK: earjack noise due to HW flaw. disable console to avoid this issue */
-extern int mako_console_stopped(void);
-#else
-static inline int mako_console_stopped(void) { return 0; }
-#endif
-
 struct msm_hsl_port {
 	struct uart_port	uart;
 	char			name[16];
@@ -69,7 +62,6 @@ struct msm_hsl_port {
 	unsigned int            old_snap_state;
 	unsigned int		ver_id;
 	int			tx_timeout;
-	short			cons_flags;
 };
 
 #define UARTDM_VERSION_11_13	0
@@ -999,9 +991,6 @@ static void msm_hsl_power(struct uart_port *port, unsigned int state,
 {
 	int ret;
 	struct msm_hsl_port *msm_hsl_port = UART_TO_MSM(port);
-	struct platform_device *pdev = to_platform_device(port->dev);
-	const struct msm_serial_hslite_platform_data *pdata =
-					pdev->dev.platform_data;
 
 	switch (state) {
 	case 0:
@@ -1013,11 +1002,10 @@ static void msm_hsl_power(struct uart_port *port, unsigned int state,
 		break;
 	case 3:
 		clk_en(port, 0);
-		if (pdata && pdata->set_uart_clk_zero) {
-			ret = clk_set_rate(msm_hsl_port->clk, 0);
-			if (ret)
-				pr_err("Error setting UART clock rate to zero.\n");
-		}
+		ret = clk_set_rate(msm_hsl_port->clk, 0);
+		if (ret)
+			pr_err("%s(): Error setting UART clock rate to zero.\n",
+								__func__);
 		break;
 	default:
 		pr_err("%s(): msm_serial_hsl: Unknown PM state %d\n",
@@ -1172,11 +1160,6 @@ static void msm_hsl_console_write(struct console *co, const char *s,
 
 	BUG_ON(co->index < 0 || co->index >= UART_NR);
 
-#ifdef CONFIG_MACH_APQ8064_MAKO
-	if (mako_console_stopped())
-		return;
-#endif
-
 	port = get_port_from_line(co->index);
 	msm_hsl_port = UART_TO_MSM(port);
 	vid = msm_hsl_port->ver_id;
@@ -1267,6 +1250,11 @@ static struct console msm_hsl_console = {
 };
 
 #define MSM_HSL_CONSOLE	(&msm_hsl_console)
+
+#ifdef CONFIG_PANTECH_UART_CONSOLE
+static unsigned enabled_console = 0;
+#endif
+
 /*
  * get_console_state - check the per-port serial console state.
  * @port: uart_port structure describing the port
@@ -1320,6 +1308,13 @@ static ssize_t set_msm_console(struct device *dev,
 	if (enable == cur_state)
 		return count;
 
+#ifdef CONFIG_PANTECH_UART_CONSOLE
+	if(!port->cons) {
+			msm_hsl_uart_driver.cons = MSM_HSL_CONSOLE;
+			port->cons = MSM_HSL_CONSOLE;
+	}
+#endif
+
 	switch (enable) {
 	case 0:
 		pr_debug("%s(): Calling stop_console\n", __func__);
@@ -1345,6 +1340,9 @@ static ssize_t set_msm_console(struct device *dev,
 		msm_hsl_power(port, 0, 1);
 		pm_runtime_enable(&pdev->dev);
 		register_console(port->cons);
+#ifdef CONFIG_PANTECH_UART_CONSOLE
+		enabled_console = 1;
+#endif
 		break;
 	default:
 		return -EINVAL;
@@ -1401,12 +1399,13 @@ static int __devinit msm_serial_hsl_probe(struct platform_device *pdev)
 	if (!gsbi_resource)
 		gsbi_resource = platform_get_resource(pdev, IORESOURCE_MEM, 1);
 	msm_hsl_port->clk = clk_get(&pdev->dev, "core_clk");
-	msm_hsl_port->pclk = clk_get(&pdev->dev, "iface_clk");
-
-	if (gsbi_resource)
+	if (gsbi_resource) {
 		msm_hsl_port->is_uartdm = 1;
-	else
+		msm_hsl_port->pclk = clk_get(&pdev->dev, "iface_clk");
+	} else {
 		msm_hsl_port->is_uartdm = 0;
+		msm_hsl_port->pclk = NULL;
+	}
 
 	if (unlikely(IS_ERR(msm_hsl_port->clk))) {
 		printk(KERN_ERR "%s: Error getting clk\n", __func__);
@@ -1487,11 +1486,8 @@ static int msm_serial_hsl_suspend(struct device *dev)
 
 	if (port) {
 
-		if (is_console(port)) {
-			struct msm_hsl_port *msm_hsl_port = UART_TO_MSM(port);
-			msm_hsl_port->cons_flags = port->cons->flags;
+		if (is_console(port))
 			msm_hsl_deinit_clock(port);
-		}
 
 		uart_suspend_port(&msm_hsl_uart_driver, port);
 		if (device_may_wakeup(dev))
@@ -1513,13 +1509,8 @@ static int msm_serial_hsl_resume(struct device *dev)
 		if (device_may_wakeup(dev))
 			disable_irq_wake(port->irq);
 
-		if (is_console(port)) {
-			struct msm_hsl_port *msm_hsl_port = UART_TO_MSM(port);
-			if (!(msm_hsl_port->cons_flags & CON_ENABLED) ||
-			    mako_console_stopped())
-				console_stop(port->cons);
+		if (is_console(port))
 			msm_hsl_init_clock(port);
-		}
 	}
 
 	return 0;
@@ -1573,6 +1564,12 @@ static int __init msm_serial_hsl_init(void)
 {
 	int ret;
 
+#ifdef CONFIG_PANTECH_UART_CONSOLE
+	if(!allowed_console) {
+		msm_hsl_uart_driver.cons = NULL;
+	}
+#endif
+
 	ret = uart_register_driver(&msm_hsl_uart_driver);
 	if (unlikely(ret))
 		return ret;
@@ -1594,7 +1591,12 @@ static void __exit msm_serial_hsl_exit(void)
 {
 	debugfs_remove_recursive(debug_base);
 #ifdef CONFIG_SERIAL_MSM_HSL_CONSOLE
+#ifdef CONFIG_PANTECH_UART_CONSOLE
+	if(enabled_console)
+		unregister_console(&msm_hsl_console);
+#else
 	unregister_console(&msm_hsl_console);
+#endif
 #endif
 	platform_driver_unregister(&msm_hsl_platform_driver);
 	uart_unregister_driver(&msm_hsl_uart_driver);

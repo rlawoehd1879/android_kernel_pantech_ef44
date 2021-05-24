@@ -1,4 +1,4 @@
-/* Copyright (c) 2010-2012, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2010-2011, Code Aurora Forum. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -23,6 +23,10 @@
 #include <linux/mfd/pm8xxx/core.h>
 #include <linux/input/pmic8xxx-pwrkey.h>
 
+#ifdef CONFIG_PANTECH_ERR_CRASH_LOGGING
+#include <mach/pantech_apanic.h>
+#endif
+
 #define PON_CNTL_1 0x1C
 #define PON_CNTL_PULL_UP BIT(7)
 #define PON_CNTL_TRIG_DELAY_MASK (0x7)
@@ -35,25 +39,38 @@
 struct pmic8xxx_pwrkey {
 	struct input_dev *pwr;
 	int key_press_irq;
-	int key_release_irq;
-	bool press;
 	const struct pm8xxx_pwrkey_platform_data *pdata;
 };
+
+#if defined(CONFIG_PANTECH_PMIC_PWRKEY)
+struct pm8921_oem_pwrkey_chip {
+  struct device		*dev;
+  int oem_pwrkey_release_irq;
+	int oem_pwrkey_press_irq;
+};
+
+static struct pm8921_oem_pwrkey_chip *oem_chip;
+
+int get_pwrkey_rt_status(void)
+{
+  if (!oem_chip)
+		return 0;
+	
+	return pm8xxx_read_irq_stat(oem_chip->dev->parent, oem_chip->oem_pwrkey_press_irq);
+}
+
+EXPORT_SYMBOL_GPL(get_pwrkey_rt_status);
+#endif
 
 static irqreturn_t pwrkey_press_irq(int irq, void *_pwrkey)
 {
 	struct pmic8xxx_pwrkey *pwrkey = _pwrkey;
 
-	if (pwrkey->press == true) {
-		pwrkey->press = false;
-		return IRQ_HANDLED;
-	} else {
-		pwrkey->press = true;
-	}
-
 	input_report_key(pwrkey->pwr, KEY_POWER, 1);
 	input_sync(pwrkey->pwr);
-
+#ifdef CONFIG_PANTECH_ERR_CRASH_LOGGING
+	pantech_force_dump_key(KEY_POWER, 1);
+#endif
 	return IRQ_HANDLED;
 }
 
@@ -61,17 +78,11 @@ static irqreturn_t pwrkey_release_irq(int irq, void *_pwrkey)
 {
 	struct pmic8xxx_pwrkey *pwrkey = _pwrkey;
 
-	if (pwrkey->press == false) {
-		input_report_key(pwrkey->pwr, KEY_POWER, 1);
-		input_sync(pwrkey->pwr);
-		pwrkey->press = true;
-	} else {
-		pwrkey->press = false;
-	}
-
 	input_report_key(pwrkey->pwr, KEY_POWER, 0);
 	input_sync(pwrkey->pwr);
-
+#ifdef CONFIG_PANTECH_ERR_CRASH_LOGGING
+	pantech_force_dump_key(KEY_POWER, 0);
+#endif
 	return IRQ_HANDLED;
 }
 
@@ -80,10 +91,8 @@ static int pmic8xxx_pwrkey_suspend(struct device *dev)
 {
 	struct pmic8xxx_pwrkey *pwrkey = dev_get_drvdata(dev);
 
-	if (device_may_wakeup(dev)) {
+	if (device_may_wakeup(dev))
 		enable_irq_wake(pwrkey->key_press_irq);
-		enable_irq_wake(pwrkey->key_release_irq);
-	}
 
 	return 0;
 }
@@ -92,10 +101,8 @@ static int pmic8xxx_pwrkey_resume(struct device *dev)
 {
 	struct pmic8xxx_pwrkey *pwrkey = dev_get_drvdata(dev);
 
-	if (device_may_wakeup(dev)) {
+	if (device_may_wakeup(dev))
 		disable_irq_wake(pwrkey->key_press_irq);
-		disable_irq_wake(pwrkey->key_release_irq);
-	}
 
 	return 0;
 }
@@ -115,6 +122,16 @@ static int __devinit pmic8xxx_pwrkey_probe(struct platform_device *pdev)
 	struct pmic8xxx_pwrkey *pwrkey;
 	const struct pm8xxx_pwrkey_platform_data *pdata =
 					dev_get_platdata(&pdev->dev);
+
+	#if defined(CONFIG_PANTECH_PMIC_PWRKEY)
+	struct pm8921_oem_pwrkey_chip *chip;
+	chip = kzalloc(sizeof(struct pm8921_oem_pwrkey_chip),
+					GFP_KERNEL);
+
+	chip->dev = &pdev->dev;
+	chip->oem_pwrkey_press_irq   = key_press_irq;
+	chip->oem_pwrkey_release_irq = key_release_irq;
+	#endif
 
 	if (!pdata) {
 		dev_err(&pdev->dev, "power key platform data not supplied\n");
@@ -176,23 +193,13 @@ static int __devinit pmic8xxx_pwrkey_probe(struct platform_device *pdev)
 	}
 
 	pwrkey->key_press_irq = key_press_irq;
-	pwrkey->key_release_irq = key_release_irq;
 	pwrkey->pwr = pwr;
 
 	platform_set_drvdata(pdev, pwrkey);
 
-	/* check power key status during boot */
-	err = pm8xxx_read_irq_stat(pdev->dev.parent, key_press_irq);
-	if (err < 0) {
-		dev_err(&pdev->dev, "reading irq status failed\n");
-		goto unreg_input_dev;
-	}
-	pwrkey->press = !!err;
-
-	if (pwrkey->press) {
-		input_report_key(pwrkey->pwr, KEY_POWER, 1);
-		input_sync(pwrkey->pwr);
-	}
+	#if defined(CONFIG_PANTECH_PMIC_PWRKEY)
+	oem_chip = chip;
+	#endif
 
 	err = request_any_context_irq(key_press_irq, pwrkey_press_irq,
 		IRQF_TRIGGER_RISING, "pmic8xxx_pwrkey_press", pwrkey);
@@ -254,13 +261,7 @@ static struct platform_driver pmic8xxx_pwrkey_driver = {
 		.pm	= &pm8xxx_pwr_key_pm_ops,
 	},
 };
-
-static int __devinit pmic8xxx_pwrkey_init(void)
-{
-	return platform_driver_register(&pmic8xxx_pwrkey_driver);
-}
-
-subsys_initcall(pmic8xxx_pwrkey_init);
+module_platform_driver(pmic8xxx_pwrkey_driver);
 
 MODULE_ALIAS("platform:pmic8xxx_pwrkey");
 MODULE_DESCRIPTION("PMIC8XXX Power Key driver");

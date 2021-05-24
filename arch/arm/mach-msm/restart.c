@@ -1,4 +1,4 @@
-/* Copyright (c) 2010-2012, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2010-2012, Code Aurora Forum. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -34,6 +34,9 @@
 #include <mach/scm.h>
 #include "msm_watchdog.h"
 #include "timer.h"
+#ifdef CONFIG_PANTECH_ERR_CRASH_LOGGING
+#include "sky_sys_reset.h"
+#endif
 
 #define WDT0_RST	0x38
 #define WDT0_EN		0x40
@@ -47,19 +50,15 @@
 
 #define SCM_IO_DISABLE_PMIC_ARBITER	1
 
-#ifdef CONFIG_LGE_CRASH_HANDLER
-#define LGE_ERROR_HANDLER_MAGIC_NUM	0xA97F2C46
-#define LGE_ERROR_HANDLER_MAGIC_ADDR	0x18
-void *lge_error_handler_cookie_addr;
-static int ssr_magic_number = 0;
-#endif
-
 static int restart_mode;
 void *restart_reason;
 
 int pmic_reset_irq;
 static void __iomem *msm_tmr0_base;
 
+#ifdef CONFIG_PANTECH_ERR_CRASH_LOGGING
+#define NORMAL_RESET_MAGIC_NUM 0xbaabcddc
+#endif
 #ifdef CONFIG_MSM_DLOAD_MODE
 static int in_panic;
 static void *dload_mode_addr;
@@ -87,10 +86,6 @@ static void set_dload_mode(int on)
 		__raw_writel(on ? 0xE47B337D : 0, dload_mode_addr);
 		__raw_writel(on ? 0xCE14091A : 0,
 		       dload_mode_addr + sizeof(unsigned int));
-#ifdef CONFIG_LGE_CRASH_HANDLER
-		__raw_writel(on ? LGE_ERROR_HANDLER_MAGIC_NUM : 0,
-				lge_error_handler_cookie_addr);
-#endif
 		mb();
 	}
 }
@@ -112,9 +107,6 @@ static int dload_set(const char *val, struct kernel_param *kp)
 	}
 
 	set_dload_mode(download_mode);
-#ifdef CONFIG_LGE_CRASH_HANDLER
-	ssr_magic_number = 0;
-#endif
 
 	return 0;
 }
@@ -122,13 +114,31 @@ static int dload_set(const char *val, struct kernel_param *kp)
 #define set_dload_mode(x) do {} while (0)
 #endif
 
+#if defined(CONFIG_PANTECH_PMIC_RESET_REASON)
+static void set_force_online_mode(void)
+{
+	if (dload_mode_addr) {
+		__raw_writel(0x34070757, dload_mode_addr);
+		__raw_writel(0x27530757,
+		       dload_mode_addr + sizeof(unsigned int));
+		mb();
+	}
+}
+
+static void set_force_offline_mode(void)
+{
+        if (dload_mode_addr) {
+                __raw_writel(0x27530757, dload_mode_addr);
+                __raw_writel(0x34070757,
+                       dload_mode_addr + sizeof(unsigned int));
+                mb();
+        }
+}
+#endif
+
 void msm_set_restart_mode(int mode)
 {
 	restart_mode = mode;
-#ifdef CONFIG_LGE_CRASH_HANDLER
-	if (download_mode == 1 && (mode & 0xFFFF0000) == 0x6D630000)
-		panic("LGE crash handler detected panic");
-#endif
 }
 EXPORT_SYMBOL(msm_set_restart_mode);
 
@@ -194,43 +204,10 @@ static irqreturn_t resout_irq_handler(int irq, void *dev_id)
 		;
 	return IRQ_HANDLED;
 }
-
-#ifdef CONFIG_LGE_CRASH_HANDLER
-#define SUBSYS_NAME_MAX_LENGTH	40
-
-int get_ssr_magic_number(void)
-{
-	return ssr_magic_number;
-}
-
-void set_ssr_magic_number(const char* subsys_name)
-{
-	int i;
-	const char *subsys_list[] = {
-		"modem", "riva", "dsps", "lpass",
-		"external_modem", "gss",
-	};
-
-	ssr_magic_number = (0x6d630000 | 0x0000f000);
-
-	for (i=0; i < ARRAY_SIZE(subsys_list); i++) {
-		if (!strncmp(subsys_list[i], subsys_name,
-					SUBSYS_NAME_MAX_LENGTH)) {
-			ssr_magic_number = (0x6d630000 | ((i+1)<<12));
-			break;
-		}
-	}
-}
-
-void set_kernel_crash_magic_number(void)
-{
-	pet_watchdog();
-	if (ssr_magic_number == 0)
-		__raw_writel(0x6d630100, restart_reason);
-	else
-		__raw_writel(restart_mode, restart_reason);
-}
-#endif /* CONFIG_LGE_CRASH_HANDLER */
+#ifdef CONFIG_PANTECH_ERR_CRASH_LOGGING
+int sky_reset_reason=SYS_RESET_REASON_UNKNOWN;
+static int sky_backlight_off = 0;
+#endif
 
 void msm_restart(char mode, const char *cmd)
 {
@@ -244,43 +221,80 @@ void msm_restart(char mode, const char *cmd)
 	set_dload_mode(in_panic);
 
 	/* Write download mode flags if restart_mode says so */
-	if (restart_mode == RESTART_DLOAD) {
+	if (restart_mode == RESTART_DLOAD)
 		set_dload_mode(1);
-#ifdef CONFIG_LGE_CRASH_HANDLER
-		writel(0x6d63c421, restart_reason);
-		goto reset;
-#endif
-	}
 
 	/* Kill download mode if master-kill switch is set */
 	if (!download_mode)
 		set_dload_mode(0);
+#endif
+#ifdef CONFIG_PANTECH_ERR_CRASH_LOGGING 
+	sky_backlight_off = sky_sys_rst_is_backlight_off();
+#endif
+#if defined(CONFIG_PANTECH_PMIC)
+	if ( in_panic == 0 )       //chjeon20120213@LS1 chg
+		set_force_online_mode();
+
+        if (mode == 0xC9)
+                set_force_offline_mode();
 #endif
 
 	printk(KERN_NOTICE "Going down for restart now\n");
 
 	pm8xxx_reset_pwr_off(1);
 
-	if (cmd != NULL) {
-		if (!strncmp(cmd, "bootloader", 10)) {
+	if (cmd != NULL) 
+	{
+		if (!strncmp(cmd, "bootloader", 10)){
 			__raw_writel(0x77665500, restart_reason);
-		} else if (!strncmp(cmd, "recovery", 8)) {
+		} 
+		else if (!strncmp(cmd, "recovery", 8)){
 			__raw_writel(0x77665502, restart_reason);
-		} else if (!strncmp(cmd, "oem-", 4)) {
+		} 
+		else if (!strncmp(cmd, "oem-", 4)){
 			unsigned long code;
 			code = simple_strtoul(cmd + 4, NULL, 16) & 0xff;
 			__raw_writel(0x6f656d00 | code, restart_reason);
-		} else {
+#ifdef CONFIG_PANTECH_FS_AUTO_REPAIR
+		} else if (!strncmp(cmd, "autorepair", 10)){
+			__raw_writel(0x776655EA, restart_reason);
+#endif /* CONFIG_PANTECH_FS_AUTO_REPAIR */
+		} else{
+#ifdef CONFIG_PANTECH_ERR_CRASH_LOGGING
+			if(in_panic){//sky_reset_reason
+				if(sky_backlight_off == 0){
+					sky_reset_reason |=
+						SYS_RESET_BACKLIGHT_OFF_FLAG;
+				}
+				writel(sky_reset_reason, restart_reason);
+			}
+			else{
+				__raw_writel(0x77665501, restart_reason);
+			}
+#else
+			__raw_writel(0x77665501, restart_reason);
+#endif
+
+		}
+	}
+#if defined(CONFIG_PANTECH_ERR_CRASH_LOGGING) || defined(CONFIG_PANTECH_WDOG_WORKAROUND)
+	else
+	{
+		if(in_panic)
+		{
+			if(sky_backlight_off == 0)
+			{
+				sky_reset_reason |= SYS_RESET_BACKLIGHT_OFF_FLAG; 
+			}
+			writel(sky_reset_reason, restart_reason);
+		 }
+		else
+		{
 			__raw_writel(0x77665501, restart_reason);
 		}
-	} else {
-		__raw_writel(0x77665501, restart_reason);
 	}
-#ifdef CONFIG_LGE_CRASH_HANDLER
-	if (in_panic == 1)
-		set_kernel_crash_magic_number();
-reset:
-#endif /* CONFIG_LGE_CRASH_HANDLER */
+        writel(NORMAL_RESET_MAGIC_NUM, restart_reason+4);
+#endif /* CONFIG_PANTECH_WDOG_WORKAROUND */
 
 	__raw_writel(0, msm_tmr0_base + WDT0_EN);
 	if (!(machine_is_msm8x60_fusion() || machine_is_msm8x60_fusn_ffa())) {
@@ -299,10 +313,29 @@ reset:
 	printk(KERN_ERR "Restarting has failed\n");
 }
 
+#ifdef CONFIG_PANTECH_ERR_CRASH_LOGGING 
+void pantech_set_restart_reason(void)
+{
+    sky_backlight_off = sky_sys_rst_is_backlight_off();
+
+    if(in_panic)
+    {//sky_reset_reason
+        if(sky_backlight_off == 0)
+        {
+            sky_reset_reason |= SYS_RESET_BACKLIGHT_OFF_FLAG; 
+        }
+        writel(sky_reset_reason, restart_reason);
+    }
+}
+#endif
+
 static int __init msm_pmic_restart_init(void)
 {
 	int rc;
 
+#if defined(CONFIG_PANTECH_ERR_CRASH_LOGGING)
+	__raw_writel(SYS_RESET_REASON_ABNORMAL, restart_reason);
+#endif
 	if (pmic_reset_irq != 0) {
 		rc = request_any_context_irq(pmic_reset_irq,
 					resout_irq_handler, IRQF_TRIGGER_HIGH,
@@ -312,10 +345,6 @@ static int __init msm_pmic_restart_init(void)
 	} else {
 		pr_warn("no pmic restart interrupt specified\n");
 	}
-
-#ifdef CONFIG_LGE_CRASH_HANDLER
-	__raw_writel(0x6d63ad00, restart_reason);
-#endif
 
 	return 0;
 }
@@ -327,10 +356,6 @@ static int __init msm_restart_init(void)
 #ifdef CONFIG_MSM_DLOAD_MODE
 	atomic_notifier_chain_register(&panic_notifier_list, &panic_blk);
 	dload_mode_addr = MSM_IMEM_BASE + DLOAD_MODE_ADDR;
-#ifdef CONFIG_LGE_CRASH_HANDLER
-	lge_error_handler_cookie_addr = MSM_IMEM_BASE +
-		LGE_ERROR_HANDLER_MAGIC_ADDR;
-#endif
 	set_dload_mode(download_mode);
 #endif
 	msm_tmr0_base = msm_timer_get_timer0_base();

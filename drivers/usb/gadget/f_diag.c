@@ -2,7 +2,7 @@
  * Diag Function Device - Route ARM9 and ARM11 DIAG messages
  * between HOST and DEVICE.
  * Copyright (C) 2007 Google, Inc.
- * Copyright (c) 2008-2013, Linux Foundation. All rights reserved.
+ * Copyright (c) 2008-2012, Code Aurora Forum. All rights reserved.
  * Author: Brian Swetland <swetland@google.com>
  * This software is licensed under the terms of the GNU General Public
  * License version 2, as published by the Free Software Foundation, and
@@ -18,14 +18,25 @@
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/platform_device.h>
-#include <linux/ratelimit.h>
 
 #include <mach/usbdiag.h>
+#include <mach/rpc_hsusb.h>
 
 #include <linux/usb/composite.h>
 #include <linux/usb/gadget.h>
 #include <linux/workqueue.h>
 #include <linux/debugfs.h>
+
+#ifdef F_PANTECH_UTS_POWER_UP
+#include <mach/restart.h>
+#include <mach/msm_smsm.h>
+unsigned int pwron_key_request1[3] = {0x20, 0x00, 0xb5}; // UTS activation
+unsigned int pwron_key_request2[3] = {0x20, 0x01, 0x51}; // press power key long
+int ready_status = 0;
+#endif
+
+//tarial bug fix [execute work queue fail after changing usb mode
+#define FEATURE_PANTECH_CLEAR_WORK_QUEUE
 
 static DEFINE_SPINLOCK(ch_lock);
 static LIST_HEAD(usb_diag_ch_list);
@@ -96,6 +107,9 @@ static struct usb_descriptor_header *hs_diag_desc[] = {
  * @out_desc: USB OUT endpoint descriptor struct
  * @read_pool: List of requests used for Rx (OUT ep)
  * @write_pool: List of requests used for Tx (IN ep)
+ * @config_work: Work item schedule after interface is configured to notify
+ *               CONNECT event to diag char driver and updating product id
+ *               and serial number to MODEM/IMEM.
  * @lock: Spinlock to proctect read_pool, write_pool lists
  * @cdev: USB composite device struct
  * @ch: USB diag channel
@@ -107,6 +121,7 @@ struct diag_context {
 	struct usb_ep *in;
 	struct list_head read_pool;
 	struct list_head write_pool;
+	struct work_struct config_work;
 	spinlock_t lock;
 	unsigned configured;
 	struct usb_composite_dev *cdev;
@@ -124,11 +139,16 @@ static inline struct diag_context *func_to_diag(struct usb_function *f)
 	return container_of(f, struct diag_context, function);
 }
 
-static void diag_update_pid_and_serial_num(struct diag_context *ctxt)
+static void usb_config_work_func(struct work_struct *work)
 {
+	struct diag_context *ctxt = container_of(work,
+			struct diag_context, config_work);
 	struct usb_composite_dev *cdev = ctxt->cdev;
 	struct usb_gadget_strings *table;
 	struct usb_string *s;
+
+	if (ctxt->ch.notify)
+		ctxt->ch.notify(ctxt->ch.priv, USB_DIAG_CONNECT, NULL);
 
 	if (!ctxt->update_pid_and_serial_num)
 		return;
@@ -282,10 +302,22 @@ void usb_diag_close(struct usb_diag_ch *ch)
 }
 EXPORT_SYMBOL(usb_diag_close);
 
-static void free_reqs(struct diag_context *ctxt)
+/**
+ * usb_diag_free_req() - Free USB requests
+ * @ch: Channel handler
+ *
+ * This function free read and write USB requests for the interface
+ * associated with this channel.
+ *
+ */
+void usb_diag_free_req(struct usb_diag_ch *ch)
 {
-	struct list_head *act, *tmp;
+	struct diag_context *ctxt = ch->priv_usb;
 	struct usb_request *req;
+	struct list_head *act, *tmp;
+
+	if (!ctxt)
+		return;
 
 	list_for_each_safe(act, tmp, &ctxt->write_pool) {
 		req = list_entry(act, struct usb_request, list);
@@ -298,27 +330,6 @@ static void free_reqs(struct diag_context *ctxt)
 		list_del(&req->list);
 		usb_ep_free_request(ctxt->out, req);
 	}
-}
-
-/**
- * usb_diag_free_req() - Free USB requests
- * @ch: Channel handler
- *
- * This function free read and write USB requests for the interface
- * associated with this channel.
- *
- */
-void usb_diag_free_req(struct usb_diag_ch *ch)
-{
-	struct diag_context *ctxt = ch->priv_usb;
-	unsigned long flags;
-
-	if (ctxt) {
-		spin_lock_irqsave(&ctxt->lock, flags);
-		free_reqs(ctxt);
-		spin_unlock_irqrestore(&ctxt->lock, flags);
-	}
-
 }
 EXPORT_SYMBOL(usb_diag_free_req);
 
@@ -338,14 +349,10 @@ int usb_diag_alloc_req(struct usb_diag_ch *ch, int n_write, int n_read)
 	struct diag_context *ctxt = ch->priv_usb;
 	struct usb_request *req;
 	int i;
-	unsigned long flags;
 
 	if (!ctxt)
 		return -ENODEV;
 
-	spin_lock_irqsave(&ctxt->lock, flags);
-	/* Free previous session's stale requests */
-	free_reqs(ctxt);
 	for (i = 0; i < n_write; i++) {
 		req = usb_ep_alloc_request(ctxt->in, GFP_ATOMIC);
 		if (!req)
@@ -361,11 +368,11 @@ int usb_diag_alloc_req(struct usb_diag_ch *ch, int n_write, int n_read)
 		req->complete = diag_read_complete;
 		list_add_tail(&req->list, &ctxt->read_pool);
 	}
-	spin_unlock_irqrestore(&ctxt->lock, flags);
+
 	return 0;
+
 fail:
-	free_reqs(ctxt);
-	spin_unlock_irqrestore(&ctxt->lock, flags);
+	usb_diag_free_req(ch);
 	return -ENOMEM;
 
 }
@@ -389,8 +396,12 @@ int usb_diag_read(struct usb_diag_ch *ch, struct diag_request *d_req)
 	struct diag_context *ctxt = ch->priv_usb;
 	unsigned long flags;
 	struct usb_request *req;
-	static DEFINE_RATELIMIT_STATE(rl, 10*HZ, 1);
 
+#ifdef F_PANTECH_UTS_POWER_UP
+	static oem_pm_smem_vendor1_data_type *smem_id_vendor1_ptr; 
+	unsigned int pwron_read_buffer[3];	
+#endif	
+	
 	if (!ctxt)
 		return -ENODEV;
 
@@ -419,12 +430,39 @@ int usb_diag_read(struct usb_diag_ch *ch, struct diag_request *d_req)
 		spin_lock_irqsave(&ctxt->lock, flags);
 		list_add_tail(&req->list, &ctxt->read_pool);
 		spin_unlock_irqrestore(&ctxt->lock, flags);
-		/* 1 error message for every 10 sec */
-		if (__ratelimit(&rl))
-			ERROR(ctxt->cdev, "%s: cannot queue"
+		ERROR(ctxt->cdev, "%s: cannot queue"
 				" read request\n", __func__);
 		return -EIO;
 	}
+
+	//printk(KERN_ERR "[%s] tarial test diag read end !!!\n", __func__);
+
+
+#ifdef F_PANTECH_UTS_POWER_UP
+	pwron_read_buffer[0] = (int)*(d_req->buf);
+	pwron_read_buffer[1] = (int)*(d_req->buf+1);
+	pwron_read_buffer[2] = (int)*(d_req->buf+2);
+
+	
+	//printk(KERN_ERR "usb_diag_read, buf = 0x%x, 0x%x, 0x%x \n",(int)*(d_req->buf), (int)*(d_req->buf+1), (int)*(d_req->buf+2));
+
+	smem_id_vendor1_ptr = (oem_pm_smem_vendor1_data_type*)smem_alloc(SMEM_ID_VENDOR1, 
+		sizeof(oem_pm_smem_vendor1_data_type));
+	//printk(KERN_ERR "smem_id_vendor1_ptr->power_on_mode = %d\n", smem_id_vendor1_ptr->power_on_mode);
+	
+	if(smem_id_vendor1_ptr->power_on_mode == 0) {
+		//printk(KERN_ERR "ready_status= %d", ready_status);
+		if(memcmp( pwron_read_buffer, pwron_key_request2, sizeof(pwron_key_request2)) == 0 && ready_status == 1) {
+			//printk(KERN_ERR "Power key long press detect!!! Reset start!!! Please wait...\n");
+			ready_status = 0;
+			msm_restart(0, 0);
+		}
+		else if(memcmp( pwron_read_buffer, pwron_key_request1, sizeof(pwron_key_request1)) == 0) {
+			//printk(KERN_ERR "UTS activation!!!\n");
+			ready_status = 1;
+		}
+	}
+#endif
 
 	return 0;
 }
@@ -448,7 +486,6 @@ int usb_diag_write(struct usb_diag_ch *ch, struct diag_request *d_req)
 	struct diag_context *ctxt = ch->priv_usb;
 	unsigned long flags;
 	struct usb_request *req = NULL;
-	static DEFINE_RATELIMIT_STATE(rl, 10*HZ, 1);
 
 	if (!ctxt)
 		return -ENODEV;
@@ -478,9 +515,7 @@ int usb_diag_write(struct usb_diag_ch *ch, struct diag_request *d_req)
 		spin_lock_irqsave(&ctxt->lock, flags);
 		list_add_tail(&req->list, &ctxt->write_pool);
 		spin_unlock_irqrestore(&ctxt->lock, flags);
-		/* 1 error message for every 10 sec */
-		if (__ratelimit(&rl))
-			ERROR(ctxt->cdev, "%s: cannot queue"
+		ERROR(ctxt->cdev, "%s: cannot queue"
 				" read request\n", __func__);
 		return -EIO;
 	}
@@ -544,6 +579,7 @@ static int diag_function_set_alt(struct usb_function *f,
 		usb_ep_disable(dev->in);
 		return rc;
 	}
+	schedule_work(&dev->config_work);
 
 	dev->dpkts_tolaptop = 0;
 	dev->dpkts_tomodem = 0;
@@ -553,9 +589,9 @@ static int diag_function_set_alt(struct usb_function *f,
 	dev->configured = 1;
 	spin_unlock_irqrestore(&dev->lock, flags);
 
-	if (dev->ch.notify)
-		dev->ch.notify(dev->ch.priv, USB_DIAG_CONNECT, NULL);
-
+#ifdef CONFIG_ANDROID_PANTECH_USB_MANAGER
+	usb_interface_enum_cb(DIAG_TYPE_FLAG);
+#endif
 	return rc;
 }
 
@@ -563,6 +599,11 @@ static void diag_function_unbind(struct usb_configuration *c,
 		struct usb_function *f)
 {
 	struct diag_context *ctxt = func_to_diag(f);
+
+#ifdef FEATURE_PANTECH_CLEAR_WORK_QUEUE
+	//tarial bug fix
+	cancel_work_sync(&ctxt->config_work);
+#endif
 
 	if (gadget_is_dualspeed(c->cdev->gadget))
 		usb_free_descriptors(f->hs_descriptors);
@@ -578,6 +619,17 @@ static int diag_function_bind(struct usb_configuration *c,
 	struct diag_context *ctxt = func_to_diag(f);
 	struct usb_ep *ep;
 	int status = -ENODEV;
+
+#if defined(CONFIG_ANDROID_PANTECH_USB)
+//	if(()pantech_usb_carrier != CARRIER_QUALCOMM) && b_pantech_usb_module){
+	if(pantech_usb_carrier != CARRIER_QUALCOMM){
+		intf_desc.bInterfaceSubClass = 0xE0;
+		intf_desc.bInterfaceProtocol = 0x10;
+	}else{
+		intf_desc.bInterfaceSubClass = 0xFF;
+		intf_desc.bInterfaceProtocol = 0xFF;
+	}
+#endif
 
 	intf_desc.bInterfaceNumber =  usb_interface_id(c, f);
 
@@ -607,7 +659,6 @@ static int diag_function_bind(struct usb_configuration *c,
 		/* copy descriptors, and track endpoint copies */
 		f->hs_descriptors = usb_copy_descriptors(hs_diag_desc);
 	}
-	diag_update_pid_and_serial_num(ctxt);
 	return 0;
 fail:
 	if (ctxt->out)
@@ -654,6 +705,7 @@ int diag_function_add(struct usb_configuration *c, const char *name,
 	spin_lock_init(&dev->lock);
 	INIT_LIST_HEAD(&dev->read_pool);
 	INIT_LIST_HEAD(&dev->write_pool);
+	INIT_WORK(&dev->config_work, usb_config_work_func);
 
 	ret = usb_add_function(c, &dev->function);
 	if (ret) {

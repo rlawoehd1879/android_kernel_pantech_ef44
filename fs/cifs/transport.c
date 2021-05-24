@@ -1,3 +1,4 @@
+#pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
 /*
  *   fs/cifs/transport.c
  *

@@ -1,3 +1,4 @@
+#pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
 /*
  * Transparent proxy support for Linux/iptables
  *

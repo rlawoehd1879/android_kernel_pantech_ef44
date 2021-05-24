@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2011-2012, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2011-2012, Code Aurora Forum. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -23,6 +23,10 @@ u32 set_get_l2_indirect_reg(u32 reg_addr, u32 val)
 	unsigned long flags;
 	u32 ret_val;
 
+	/* CP15 registers are not emulated on RUMI3. */
+	if (machine_is_msm8960_rumi3())
+		return 0;
+
 	raw_spin_lock_irqsave(&l2_access_lock, flags);
 	mb();
 	asm volatile ("mcr     p15, 3, %[l2cpselr], c15, c0, 6\n\t"
@@ -43,6 +47,10 @@ void set_l2_indirect_reg(u32 reg_addr, u32 val)
 {
 	unsigned long flags;
 
+	/* CP15 registers are not emulated on RUMI3. */
+	if (machine_is_msm8960_rumi3())
+		return;
+
 	raw_spin_lock_irqsave(&l2_access_lock, flags);
 	mb();
 	asm volatile ("mcr     p15, 3, %[l2cpselr], c15, c0, 6\n\t"
@@ -60,6 +68,9 @@ u32 get_l2_indirect_reg(u32 reg_addr)
 {
 	u32 val;
 	unsigned long flags;
+	/* CP15 registers are not emulated on RUMI3. */
+	if (machine_is_msm8960_rumi3())
+		return 0;
 
 	raw_spin_lock_irqsave(&l2_access_lock, flags);
 	asm volatile ("mcr     p15, 3, %[l2cpselr], c15, c0, 6\n\t"

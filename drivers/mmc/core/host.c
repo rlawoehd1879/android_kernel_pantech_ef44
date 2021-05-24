@@ -4,7 +4,6 @@
  *  Copyright (C) 2003 Russell King, All Rights Reserved.
  *  Copyright (C) 2007-2008 Pierre Ossman
  *  Copyright (C) 2010 Linus Walleij
- *  Copyright (c) 2012, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 as
@@ -164,9 +163,6 @@ void mmc_host_clk_hold(struct mmc_host *host)
 	if (host->clk_gated) {
 		spin_unlock_irqrestore(&host->clk_lock, flags);
 		mmc_ungate_clock(host);
-
-		/* Reset clock scaling stats as host is out of idle */
-		mmc_reset_clk_scale_stats(host);
 		spin_lock_irqsave(&host->clk_lock, flags);
 		pr_debug("%s: ungated MCI clock\n", mmc_hostname(host));
 	}
@@ -363,169 +359,6 @@ free:
 }
 
 EXPORT_SYMBOL(mmc_alloc_host);
-
-static ssize_t show_enable(struct device *dev,
-		struct device_attribute *attr, char *buf)
-{
-	struct mmc_host *host = cls_dev_to_mmc_host(dev);
-
-	if (!host)
-		return -EINVAL;
-
-	return snprintf(buf, PAGE_SIZE, "%d\n", mmc_can_scale_clk(host));
-}
-
-static ssize_t store_enable(struct device *dev,
-		struct device_attribute *attr, const char *buf, size_t count)
-{
-	struct mmc_host *host = cls_dev_to_mmc_host(dev);
-	unsigned long value, freq;
-	int retval = -EINVAL;
-
-	if (!host)
-		goto out;
-
-	mmc_claim_host(host);
-	if (!host->card || kstrtoul(buf, 0, &value))
-		goto err;
-
-	if (value && !mmc_can_scale_clk(host)) {
-		host->caps2 |= MMC_CAP2_CLK_SCALE;
-		mmc_init_clk_scaling(host);
-
-		if (!mmc_can_scale_clk(host)) {
-			host->caps2 &= ~MMC_CAP2_CLK_SCALE;
-			goto err;
-		}
-	} else if (!value && mmc_can_scale_clk(host)) {
-		host->caps2 &= ~MMC_CAP2_CLK_SCALE;
-		mmc_disable_clk_scaling(host);
-
-		/* Set to max. frequency, since we are disabling */
-		if (host->bus_ops && host->bus_ops->change_bus_speed) {
-			freq = mmc_get_max_frequency(host);
-			if (host->bus_ops->change_bus_speed(host, &freq))
-				goto err;
-		}
-		if (host->ops->notify_load &&
-				host->ops->notify_load(host, MMC_LOAD_HIGH))
-			goto err;
-		host->clk_scaling.state = MMC_LOAD_HIGH;
-		host->clk_scaling.initialized = false;
-	}
-	retval = count;
-err:
-	mmc_release_host(host);
-out:
-	return retval;
-}
-
-static ssize_t show_up_threshold(struct device *dev,
-		struct device_attribute *attr, char *buf)
-{
-	struct mmc_host *host = cls_dev_to_mmc_host(dev);
-
-	if (!host)
-		return -EINVAL;
-
-	return snprintf(buf, PAGE_SIZE, "%d\n", host->clk_scaling.up_threshold);
-}
-
-#define MAX_PERCENTAGE	100
-static ssize_t store_up_threshold(struct device *dev,
-		struct device_attribute *attr, const char *buf, size_t count)
-{
-	struct mmc_host *host = cls_dev_to_mmc_host(dev);
-	unsigned long value;
-
-	if (!host || kstrtoul(buf, 0, &value) || (value > MAX_PERCENTAGE))
-		return -EINVAL;
-
-	host->clk_scaling.up_threshold = value;
-
-	pr_debug("%s: clkscale_up_thresh set to %lu\n",
-			mmc_hostname(host), value);
-	return count;
-}
-
-static ssize_t show_down_threshold(struct device *dev,
-		struct device_attribute *attr, char *buf)
-{
-	struct mmc_host *host = cls_dev_to_mmc_host(dev);
-
-	if (!host)
-		return -EINVAL;
-
-	return snprintf(buf, PAGE_SIZE, "%d\n",
-			host->clk_scaling.down_threshold);
-}
-
-static ssize_t store_down_threshold(struct device *dev,
-		struct device_attribute *attr, const char *buf, size_t count)
-{
-	struct mmc_host *host = cls_dev_to_mmc_host(dev);
-	unsigned long value;
-
-	if (!host || kstrtoul(buf, 0, &value) || (value > MAX_PERCENTAGE))
-		return -EINVAL;
-
-	host->clk_scaling.down_threshold = value;
-
-	pr_debug("%s: clkscale_down_thresh set to %lu\n",
-			mmc_hostname(host), value);
-	return count;
-}
-
-static ssize_t show_polling(struct device *dev,
-		struct device_attribute *attr, char *buf)
-{
-	struct mmc_host *host = cls_dev_to_mmc_host(dev);
-
-	if (!host)
-		return -EINVAL;
-
-	return snprintf(buf, PAGE_SIZE, "%lu milliseconds\n",
-			host->clk_scaling.polling_delay_ms);
-}
-
-static ssize_t store_polling(struct device *dev,
-		struct device_attribute *attr, const char *buf, size_t count)
-{
-	struct mmc_host *host = cls_dev_to_mmc_host(dev);
-	unsigned long value;
-
-	if (!host || kstrtoul(buf, 0, &value))
-		return -EINVAL;
-
-	host->clk_scaling.polling_delay_ms = value;
-
-	pr_debug("%s: clkscale_polling_delay_ms set to %lu\n",
-			mmc_hostname(host), value);
-	return count;
-}
-
-DEVICE_ATTR(enable, S_IRUGO | S_IWUSR,
-		show_enable, store_enable);
-DEVICE_ATTR(polling_interval, S_IRUGO | S_IWUSR,
-		show_polling, store_polling);
-DEVICE_ATTR(up_threshold, S_IRUGO | S_IWUSR,
-		show_up_threshold, store_up_threshold);
-DEVICE_ATTR(down_threshold, S_IRUGO | S_IWUSR,
-		show_down_threshold, store_down_threshold);
-
-static struct attribute *clk_scaling_attrs[] = {
-	&dev_attr_enable.attr,
-	&dev_attr_up_threshold.attr,
-	&dev_attr_down_threshold.attr,
-	&dev_attr_polling_interval.attr,
-	NULL,
-};
-
-static struct attribute_group clk_scaling_attr_grp = {
-	.name = "clk_scaling",
-	.attrs = clk_scaling_attrs,
-};
-
 #ifdef CONFIG_MMC_PERF_PROFILING
 static ssize_t
 show_perf(struct device *dev, struct device_attribute *attr, char *buf)
@@ -577,10 +410,127 @@ static DEVICE_ATTR(perf, S_IRUGO | S_IWUSR,
 
 #endif
 
+/* 20121221 LS1-JHM modified : enabling BKOPS for eMMC performance */
+#ifdef FEATURE_PANTECH_SAMSUNG_EMMC_BUG_FIX
+
+static ssize_t
+show_do_bkops(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct mmc_host *host = dev_get_drvdata(dev);
+	return snprintf(buf, PAGE_SIZE, "%d\n", host->bkops_force_start);
+}
+
+static ssize_t
+set_do_bkops(struct device *dev, struct device_attribute *attr,
+		const char *buf, size_t count)
+{	
+	int value;
+	struct mmc_host *host = dev_get_drvdata(dev);
+
+	sscanf(buf, "%d", &value);
+
+	spin_lock(&host->lock);
+
+	if(value)
+		host->bkops_force_start = true;
+	else
+		host->bkops_force_start = false;
+	
+	spin_unlock(&host->lock);
+
+	return count;
+}
+
+static DEVICE_ATTR(do_bkops, S_IRUGO | S_IWUSR,
+		show_do_bkops, set_do_bkops);
+
+static ssize_t
+show_bkops_count(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	s64 max_diff_time = 0, sum_diff_time = 0, min_diff_time = 0;
+	struct mmc_host *host = dev_get_drvdata(dev);
+
+	spin_lock(&host->lock);
+	max_diff_time = host->bkops_diff_time[MMC_BKOPS_DIFF_MAX];
+	min_diff_time = host->bkops_diff_time[MMC_BKOPS_DIFF_MIN];
+	sum_diff_time = host->bkops_diff_time[MMC_BKOPS_DIFF_SUM];
+	spin_unlock(&host->lock);
+	
+	return snprintf(buf, PAGE_SIZE, "started %d, count %d, chk_bk %d, do_bk %d, max %lld, min %lld, sum %lld\n", 
+		host->bkops_started, host->bkops_start_count, 
+		mmc_card_check_bkops(host->card), mmc_card_doing_bkops(host->card),
+		max_diff_time, min_diff_time, sum_diff_time);
+}
+
+static DEVICE_ATTR(bkops_count, S_IRUGO | S_IWUSR,
+		show_bkops_count, NULL);
+
+static ssize_t
+show_bkops_max_time(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct mmc_host *host = dev_get_drvdata(dev);
+	return snprintf(buf, PAGE_SIZE, "%lu\n", host->req_bkops_timer_value);
+}
+
+static ssize_t
+set_bkops_max_time(struct device *dev, struct device_attribute *attr,
+		const char *buf, size_t count)
+{	
+	unsigned long value;
+	struct mmc_host *host = dev_get_drvdata(dev);
+
+	sscanf(buf, "%lu", &value);
+
+	spin_lock(&host->lock);
+	host->req_bkops_timer_value = value;
+	spin_unlock(&host->lock);
+
+	return count;
+}
+
+static DEVICE_ATTR(bkops_max_time, S_IRUGO | S_IWUSR,
+		show_bkops_max_time, set_bkops_max_time);
+
+
+static ssize_t
+set_bkops_log_on(struct device *dev, struct device_attribute *attr,
+		const char *buf, size_t count)
+{	
+	int value;
+	struct mmc_host *host = dev_get_drvdata(dev);
+
+	sscanf(buf, "%d", &value);
+
+	spin_lock(&host->lock);
+
+	if(value)
+		host->bkops_log_en = true;
+	else
+		host->bkops_log_en = false;
+	
+	spin_unlock(&host->lock);
+
+	return count;
+}
+
+static DEVICE_ATTR(bkops_log_on, S_IRUGO | S_IWUSR,
+		NULL, set_bkops_log_on);
+
+#endif
+
 static struct attribute *dev_attrs[] = {
 #ifdef CONFIG_MMC_PERF_PROFILING
 	&dev_attr_perf.attr,
 #endif
+
+/* 20121221 LS1-JHM modified : enabling BKOPS for eMMC performance */
+#ifdef FEATURE_PANTECH_SAMSUNG_EMMC_BUG_FIX
+	&dev_attr_do_bkops.attr,
+	&dev_attr_bkops_count.attr,
+	&dev_attr_bkops_max_time.attr,
+	&dev_attr_bkops_log_on.attr,
+#endif
+
 	NULL,
 };
 static struct attribute_group dev_attr_grp = {
@@ -612,15 +562,6 @@ int mmc_add_host(struct mmc_host *host)
 	mmc_add_host_debugfs(host);
 #endif
 	mmc_host_clk_sysfs_init(host);
-
-	host->clk_scaling.up_threshold = 35;
-	host->clk_scaling.down_threshold = 5;
-	host->clk_scaling.polling_delay_ms = 100;
-
-	err = sysfs_create_group(&host->class_dev.kobj, &clk_scaling_attr_grp);
-	if (err)
-		pr_err("%s: failed to create clk scale sysfs group with err %d\n",
-				__func__, err);
 
 	err = sysfs_create_group(&host->parent->kobj, &dev_attr_grp);
 	if (err)
@@ -655,7 +596,7 @@ void mmc_remove_host(struct mmc_host *host)
 	mmc_remove_host_debugfs(host);
 #endif
 	sysfs_remove_group(&host->parent->kobj, &dev_attr_grp);
-	sysfs_remove_group(&host->class_dev.kobj, &clk_scaling_attr_grp);
+
 
 	device_del(&host->class_dev);
 

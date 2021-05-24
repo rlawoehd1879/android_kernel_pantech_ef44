@@ -1,4 +1,4 @@
-/* Copyright (c) 2010, 2012, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2010, 2012, Code Aurora Forum. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -178,8 +178,6 @@ struct vpe_ctrl_type {
 	enum vpe_state    state;
 	unsigned long     out_y_addr;
 	unsigned long     out_cbcr_addr;
-        struct device *iommu_ctx_src;
-        struct device *iommu_ctx_dst;
 };
 
 /*
